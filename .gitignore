@@ -1,0 +1,10 @@
+# Never publish scanner calibration or raw measurement data.
+girfs/
+**/girfs/
+**/sp2dGIRF_*.dat
+*.dat
+
+# Local/editor artifacts
+.vscode/
+.DS_Store
+Thumbs.db

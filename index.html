@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none';" />
+<title>kOreo — Trajectory Extractor</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand-row">
+      <div>
+        <p class="eyebrow">UTE trajectory toolkit</p>
+        <h1>kOreo <span class="tag">Trajectory Dashboard</span></h1>
+      </div>
+      <span class="privacy-badge">● Local processing</span>
+    </div>
+    <p class="sub">Inspect a Siemens <code>.dat</code>, apply scanner-matched GIRF correction, and export reconstruction-ready trajectories.</p>
+  </header>
+
+  <main>
+    <section id="drop" class="drop-zone">
+      <input type="file" id="file-input" accept=".dat" hidden />
+      <div class="drop-inner">
+        <div class="drop-icon">⇩</div>
+        <p><strong>Drop a .dat here</strong> or <button id="browse-btn" type="button">browse…</button></p>
+        <p class="hint">Files stay on your machine.</p>
+      </div>
+    </section>
+
+    <section id="status" class="status hidden"></section>
+
+    <div id="left-stack">
+      <section id="measurement-picker" class="panel hidden">
+        <h2>TWIX measurements</h2>
+        <p class="hint">This file contains multiple measurements (adjustment scans + main scan). The imaging scan is auto-selected; override if needed.</p>
+        <label>Active measurement:
+          <select id="measurement-select"></select>
+        </label>
+      </section>
+
+      <section id="girf-panel" class="panel hidden">
+        <h2>GIRF correction <span class="tag">optional</span></h2>
+        <p class="hint">Load your GIRF <code>sp2dGIRF_*.dat</code> files once via <strong>GIRF folder…</strong>; they are stored locally in this browser (IndexedDB) and auto-matched to the detected scanner on future visits. Nothing is uploaded or committed.</p>
+        <div class="actions">
+          <input type="file" id="girf-dir-input" webkitdirectory directory multiple hidden />
+          <button id="girf-dir-browse-btn" type="button">GIRF folder…</button>
+          <input type="file" id="girf-input" accept=".dat,.bin" hidden />
+          <button id="girf-browse-btn" type="button">GIRF file…</button>
+        </div>
+        <div id="girf-library-info" class="girf-info">No GIRFs stored yet — load a GIRF folder/file once and it is remembered locally.</div>
+        <div id="girf-info" class="girf-info">(no GIRF loaded — nominal trajectory will be used)</div>
+      </section>
+    </div>
+
+    <section id="params-panel" class="panel hidden">
+      <h2>Parsed parameters</h2>
+      <table id="params-table"></table>
+      <details>
+        <summary>Edit / override</summary>
+        <div id="params-form"></div>
+      </details>
+    </section>
+
+    <section id="traj-panel" class="panel hidden">
+      <h2>Computed trajectory</h2>
+      <div id="traj-stats"></div>
+      <div class="actions compute-controls">
+        <label>
+          Number of spokes:
+          <input type="number" id="n-spokes" value="1000" min="1" max="200000" />
+        </label>
+        <label title="Match Oreo getDCF: keep the radial DCF constant outside the 3-D radial Nyquist radius.">
+          <input type="checkbox" id="flat-dcf" checked /> Flat DCF after Nyquist radius
+        </label>
+        <progress id="compute-progress" class="hidden" max="1" value="0"></progress>
+      </div>
+      <div class="export-card">
+        <div class="export-heading">
+          <div>
+            <strong>Export</strong>
+            <span>Downloads reflect the selected trajectory.</span>
+          </div>
+          <label class="mode-control">Trajectory
+            <select id="trajectory-mode">
+              <option value="nominal">Nominal</option>
+              <option value="girf" disabled>GIRF-corrected</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions download-actions">
+          <button id="download-mat" type="button" disabled><span>MATLAB</span>.mat</button>
+          <button id="download-npz" type="button" disabled><span>NumPy</span>.npz</button>
+          <button id="download-pro" class="secondary" type="button" disabled title="Contains the complete scanner protocol and sequence parameters. Treat as confidential and do not share publicly."><span>Scanner protocol ⚠</span>.pro</button>
+          <button id="download-json" class="secondary" type="button" disabled><span>Parameters</span>.json</button>
+        </div>
+      </div>
+      <canvas id="preview" width="560" height="460"></canvas>
+    </section>
+  </main>
+
+  <footer>
+    <p>kOreo v0.35 · 3D-radial center-out, optional GIRF correction.
+       Auto-selects the UTE (wip_794) imaging scan when a TWIX file contains adjustment scans.
+       GIRF maths run entirely in the browser; nothing is uploaded.</p>
+  </footer>
+
+  <script src="app.js?v=0.35" type="module"></script>
+</body>
+</html>
