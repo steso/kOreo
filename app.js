@@ -544,6 +544,12 @@ export function parseParamsFromProtocol(text) {
     matchNumber(text, "sWiPMemBlock.alFree", 6),
     0,
   );
+  // MATLAB alFree{18}: trajectory indices are acquired in bit-reversed rank order.
+  p.bit_reversal = firstDef(
+    matchNumber(text, "sWipMemBlock.alFree", 17),
+    matchNumber(text, "sWiPMemBlock.alFree", 17),
+    0,
+  ) === 1;
   // Scanner type (WIP alFree[16]). Authoritative source is the binary
   // UteSeqData packet (extracted separately); this ASCII value is a fallback.
   p.scanner_type = firstDef(
@@ -806,6 +812,34 @@ const TRAJECTORY_MODE = {
 
 const DEFAULT_TRAJECTORY_MODE = TRAJECTORY_MODE.MIN_DISC_NEW;
 
+export function bitReversalPermutation(n) {
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new RangeError("Spoke count must be a positive integer.");
+  }
+
+  const permutation = new Uint32Array(n);
+  if (n === 1) return permutation;
+
+  const reversedValues = new Uint32Array(n);
+  const sortedIndices = new Uint32Array(n);
+  const numBits = Math.ceil(Math.log2(n));
+  for (let i = 0; i < n; ++i) {
+    let value = i;
+    let reversed = 0;
+    for (let bit = 0; bit < numBits; ++bit) {
+      reversed = reversed * 2 + (value % 2);
+      value = Math.floor(value / 2);
+    }
+    reversedValues[i] = reversed;
+    sortedIndices[i] = i;
+  }
+  sortedIndices.sort((a, b) => reversedValues[a] - reversedValues[b]);
+  for (let rank = 0; rank < n; ++rank) {
+    permutation[sortedIndices[rank]] = rank;
+  }
+  return permutation;
+}
+
 // Fibonacci-sphere spokes retained as an alternative mode.
 function fibonacciSpokes(n) {
   const polar = new Float64Array(n);
@@ -867,14 +901,19 @@ function buildSpokes(n, p) {
   const modeRaw = String(p?.trajectory_mode || DEFAULT_TRAJECTORY_MODE).toLowerCase();
   const mode = modeRaw.replace(/[_\s-]+/g, "");
 
+  let spokes;
   if (mode === TRAJECTORY_MODE.FIBONACCI) {
-    return fibonacciSpokes(n);
+    spokes = fibonacciSpokes(n);
+  } else if (mode === TRAJECTORY_MODE.MIN_DISC_OLD) {
+    spokes = minDiscSpokes(n, true, p?.trajectory_scale || 1.0);
+  } else {
+    // Default (and fallback) mode: minDiscNew.
+    spokes = minDiscSpokes(n, false, p?.trajectory_scale || 1.0);
   }
-  if (mode === TRAJECTORY_MODE.MIN_DISC_OLD) {
-    return minDiscSpokes(n, true, p?.trajectory_scale || 1.0);
-  }
-  // Default (and fallback) mode: minDiscNew.
-  return minDiscSpokes(n, false, p?.trajectory_scale || 1.0);
+  return {
+    ...spokes,
+    order: p?.bit_reversal ? bitReversalPermutation(n) : null,
+  };
 }
 
 /**
@@ -895,7 +934,7 @@ export function computeTrajectory(p, nSpokes, girf, flatDcf = true) {
     sx = gs.x; sy = gs.y; sz = gs.z;
   }
 
-  const { polar, azim } = buildSpokes(nSpokes, p);
+  const { polar, azim, order } = buildSpokes(nSpokes, p);
   const nSamples = g.n_col_meas;
   const kxAll = new Float32Array(nSpokes * nSamples);
   const kyAll = new Float32Array(nSpokes * nSamples);
@@ -904,8 +943,9 @@ export function computeTrajectory(p, nSpokes, girf, flatDcf = true) {
   // Build grid-coordinate trajectory directly into output, then normalize
   // once at the end (one pass, no extra allocations).
   for (let s = 0; s < nSpokes; ++s) {
-    const sp = Math.sin(polar[s]), cp = Math.cos(polar[s]);
-    const sa = Math.sin(azim[s]),  ca = Math.cos(azim[s]);
+    const trajectoryIndex = order ? order[s] : s;
+    const sp = Math.sin(polar[trajectoryIndex]), cp = Math.cos(polar[trajectoryIndex]);
+    const sa = Math.sin(azim[trajectoryIndex]),  ca = Math.cos(azim[trajectoryIndex]);
     correctLineInto(
       sp*ca, sp*sa, cp, p.rot_matrix, sx, sy, sz, g,
       kxAll, kyAll, kzAll, s * nSamples, nSamples,
@@ -933,6 +973,7 @@ export function computeTrajectory(p, nSpokes, girf, flatDcf = true) {
     n_spokes: nSpokes, n_samples: nSamples, grid: g,
     girf_applied: !!girf,
     girf_delay_us: girf ? GIRF_DELAY_US : 0,
+    bit_reversal: !!p.bit_reversal,
     flat_dcf: flatDcf,
     dcf_nyquist_radius: nyquistRadius,
   };
@@ -943,7 +984,9 @@ export function computeTrajectory(p, nSpokes, girf, flatDcf = true) {
  * event loop between chunks so a progress bar can update and the UI stays
  * responsive. `onProgress(fraction)` is called after each chunk.
  */
-async function computeTrajectoryChunked(p, nSpokes, girf, onProgress, flatDcf = true) {
+async function computeTrajectoryChunked(
+  p, nSpokes, girf, onProgress, flatDcf = true, shouldCancel = () => false,
+) {
   const g = computeGridConfig(p);
   const mdk = computeADCSamplingEcho0(p, g);
   const mdk32 = Float32Array.from(mdk);
@@ -955,7 +998,7 @@ async function computeTrajectoryChunked(p, nSpokes, girf, onProgress, flatDcf = 
     radialProfile = gs.x;
   }
 
-  const { polar, azim } = buildSpokes(nSpokes, p);
+  const { polar, azim, order } = buildSpokes(nSpokes, p);
   const nSamples = g.n_col_meas;
   const kxAll = new Float32Array(nSpokes * nSamples);
   const kyAll = new Float32Array(nSpokes * nSamples);
@@ -963,10 +1006,12 @@ async function computeTrajectoryChunked(p, nSpokes, girf, onProgress, flatDcf = 
 
   const CHUNK = 3000;
   for (let s0 = 0; s0 < nSpokes; s0 += CHUNK) {
+    if (shouldCancel()) throw new Error("Trajectory computation superseded.");
     const s1 = Math.min(nSpokes, s0 + CHUNK);
     for (let s = s0; s < s1; ++s) {
-      const sp = Math.sin(polar[s]), cp = Math.cos(polar[s]);
-      const sa = Math.sin(azim[s]),  ca = Math.cos(azim[s]);
+      const trajectoryIndex = order ? order[s] : s;
+      const sp = Math.sin(polar[trajectoryIndex]), cp = Math.cos(polar[trajectoryIndex]);
+      const sa = Math.sin(azim[trajectoryIndex]),  ca = Math.cos(azim[trajectoryIndex]);
       correctLineInto(
         sp*ca, sp*sa, cp, p.rot_matrix, sx, sy, sz, g,
         kxAll, kyAll, kzAll, s * nSamples, nSamples,
@@ -980,10 +1025,16 @@ async function computeTrajectoryChunked(p, nSpokes, girf, onProgress, flatDcf = 
   const centerN  = gridSize / 2;
   const inv = 1 / gridSize;
   const N = kxAll.length;
-  for (let i = 0; i < N; ++i) {
-    kxAll[i] = (kxAll[i] - centerN) * inv;
-    kyAll[i] = (kyAll[i] - centerN) * inv;
-    kzAll[i] = (kzAll[i] - centerN) * inv;
+  const NORMALIZE_CHUNK = 1_000_000;
+  for (let i0 = 0; i0 < N; i0 += NORMALIZE_CHUNK) {
+    if (shouldCancel()) throw new Error("Trajectory computation superseded.");
+    const i1 = Math.min(N, i0 + NORMALIZE_CHUNK);
+    for (let i = i0; i < i1; ++i) {
+      kxAll[i] = (kxAll[i] - centerN) * inv;
+      kyAll[i] = (kyAll[i] - centerN) * inv;
+      kzAll[i] = (kzAll[i] - centerN) * inv;
+    }
+    await new Promise(r => setTimeout(r, 0));
   }
 
   if (flatDcf) radialProfile = oreoFlatDcfProfile(mdk, p, g);
@@ -994,6 +1045,7 @@ async function computeTrajectoryChunked(p, nSpokes, girf, onProgress, flatDcf = 
     n_spokes: nSpokes, n_samples: nSamples, grid: g,
     girf_applied: !!girf,
     girf_delay_us: girf ? GIRF_DELAY_US : 0,
+    bit_reversal: !!p.bit_reversal,
     flat_dcf: flatDcf,
     dcf_nyquist_radius: nyquistRadius,
   };
@@ -1434,7 +1486,7 @@ function computeGirfSampling(p, g, girf) {
 // ===========================================================================
 // NumPy .npy writer (little-endian float32 arrays, format v1.0)
 // ===========================================================================
-function writeNpy(arr, shape) {
+function buildNpyParts(arr, shape) {
   const header = `{'descr': '<f4', 'fortran_order': False, 'shape': (${shape.join(", ")}${shape.length === 1 ? "," : ""}), }`;
   // Header is padded so (10 + headerLen) % 64 == 0 and last char is '\n'
   const preamble = 10;
@@ -1442,16 +1494,22 @@ function writeNpy(arr, shape) {
   const pad = 64 - ((preamble + hdr.length + 1) % 64);
   hdr += " ".repeat(pad) + "\n";
 
-  const buf = new ArrayBuffer(preamble + hdr.length + arr.byteLength);
-  const view = new DataView(buf);
-  const u8 = new Uint8Array(buf);
+  const headerBytes = new Uint8Array(preamble + hdr.length);
+  const view = new DataView(headerBytes.buffer);
   // Magic + version
-  u8.set([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59], 0); // \x93NUMPY
-  u8[6] = 1; u8[7] = 0;                              // major, minor
+  headerBytes.set([0x93, 0x4E, 0x55, 0x4D, 0x50, 0x59], 0); // \x93NUMPY
+  headerBytes[6] = 1; headerBytes[7] = 0;                    // major, minor
   view.setUint16(8, hdr.length, true);
-  for (let i = 0; i < hdr.length; ++i) u8[10 + i] = hdr.charCodeAt(i);
-  u8.set(new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength), preamble + hdr.length);
-  return new Blob([u8], { type: "application/octet-stream" });
+  for (let i = 0; i < hdr.length; ++i) headerBytes[10 + i] = hdr.charCodeAt(i);
+  const dataBytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  return {
+    parts: [headerBytes, dataBytes],
+    byteLength: headerBytes.byteLength + dataBytes.byteLength,
+  };
+}
+
+function writeNpy(arr, shape) {
+  return new Blob(buildNpyParts(arr, shape).parts, { type: "application/octet-stream" });
 }
 
 // Bundle multiple arrays into a .npz (uncompressed zip).
@@ -1469,43 +1527,48 @@ async function writeNpzAsync(arrays) {
     }
     return t;
   })();
-  const crc32 = buf => {
+  const crc32 = async buffers => {
     let crc = 0xFFFFFFFF;
-    for (let i = 0; i < buf.length; ++i)
-      crc = (crc >>> 8) ^ crcTable[(crc ^ buf[i]) & 0xFF];
+    for (const buf of buffers) {
+      for (let i0 = 0; i0 < buf.length; i0 += 1024 * 1024) {
+        const i1 = Math.min(buf.length, i0 + 1024 * 1024);
+        for (let i = i0; i < i1; ++i)
+          crc = (crc >>> 8) ^ crcTable[(crc ^ buf[i]) & 0xFF];
+        if (i1 < buf.length) await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
     return (crc ^ 0xFFFFFFFF) >>> 0;
   };
 
   for (const [name, { data, shape }] of Object.entries(arrays)) {
-    const npy = writeNpy(data, shape);
-    const fileBuf = new Uint8Array(await npy.arrayBuffer());
+    const npy = buildNpyParts(data, shape);
     const fname = enc.encode(name + ".npy");
-    const crc = crc32(fileBuf);
+    const crc = await crc32(npy.parts);
     const localHeader = new Uint8Array(30 + fname.length);
     const lv = new DataView(localHeader.buffer);
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(4, 20, true);
     lv.setUint16(8, 0, true);
     lv.setUint32(14, crc, true);
-    lv.setUint32(18, fileBuf.length, true);
-    lv.setUint32(22, fileBuf.length, true);
+    lv.setUint32(18, npy.byteLength, true);
+    lv.setUint32(22, npy.byteLength, true);
     lv.setUint16(26, fname.length, true);
     localHeader.set(fname, 30);
-    parts.push(localHeader, fileBuf);
+    parts.push(localHeader, ...npy.parts);
 
     const centralEntry = new Uint8Array(46 + fname.length);
     const cv = new DataView(centralEntry.buffer);
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(4, 20, true); cv.setUint16(6, 20, true);
     cv.setUint32(16, crc, true);
-    cv.setUint32(20, fileBuf.length, true);
-    cv.setUint32(24, fileBuf.length, true);
+    cv.setUint32(20, npy.byteLength, true);
+    cv.setUint32(24, npy.byteLength, true);
     cv.setUint16(28, fname.length, true);
     cv.setUint32(42, offset, true);
     centralEntry.set(fname, 46);
     central.push(centralEntry);
 
-    offset += localHeader.length + fileBuf.length;
+    offset += localHeader.length + npy.byteLength;
   }
   let centralSize = 0; for (const c of central) centralSize += c.length;
   const end = new Uint8Array(22);
@@ -1570,25 +1633,22 @@ function writeMatV5(vars) {
     // 4) Real part (miSINGLE = 7)
     const dataBytes = data.byteLength;
     const dataPad = padTo8(dataBytes);
-    const dataBlock = new Uint8Array(8 + dataBytes + dataPad);
-    const dvh = new DataView(dataBlock.buffer);
+    const dataHeader = new Uint8Array(8);
+    const dvh = new DataView(dataHeader.buffer);
     dvh.setUint32(0, 7, true);           // miSINGLE
     dvh.setUint32(4, dataBytes, true);
-    dataBlock.set(new Uint8Array(data.buffer, data.byteOffset, dataBytes), 8);
+    const dataView = new Uint8Array(data.buffer, data.byteOffset, dataBytes);
+    const dataPadding = new Uint8Array(dataPad);
 
     // Wrap all four in a miMATRIX
-    const body = new Uint8Array(af.length + dims.length + nameBlock.length + dataBlock.length);
-    let o = 0;
-    body.set(af, o); o += af.length;
-    body.set(dims, o); o += dims.length;
-    body.set(nameBlock, o); o += nameBlock.length;
-    body.set(dataBlock, o);
+    const bodyLength = af.length + dims.length + nameBlock.length +
+      dataHeader.length + dataBytes + dataPadding.length;
 
     const tag = new Uint8Array(8);
     const tv = new DataView(tag.buffer);
     tv.setUint32(0, 14, true);           // miMATRIX
-    tv.setUint32(4, body.length, true);
-    chunks.push(tag, body);
+    tv.setUint32(4, bodyLength, true);
+    chunks.push(tag, af, dims, nameBlock, dataHeader, dataView, dataPadding);
   }
   return new Blob(chunks, { type: "application/octet-stream" });
 }
@@ -1636,6 +1696,7 @@ function renderParams(p) {
       : null,
     ["Base resolution", p.n_base_resolution],
     ["N projections", p.n_projections],
+    ["Bit reversal", p.bit_reversal ? "enabled" : "disabled"],
     ["N col meas raw", p.n_col_meas_raw],
     ["FOV [mm]", p.fov],
     ["Dwell time [ns]", p.dwell_time_ns],
@@ -1858,6 +1919,9 @@ let g_computeToken = 0;
 function scheduleCompute(delay = 450) {
   if (!g_params) return;
   clearTimeout(g_computeTimer);
+  g_result = null;
+  $("#download-mat").disabled = true;
+  $("#download-npz").disabled = true;
   g_computeTimer = setTimeout(runCompute, delay);
 }
 
@@ -1879,7 +1943,7 @@ async function runCompute() {
   try {
     result = await computeTrajectoryChunked(g_params, nSpokes, useGirf ? g_girf : null, frac => {
       if (token === g_computeToken && prog) prog.value = frac;
-    }, flatDcf);
+    }, flatDcf, () => token !== g_computeToken);
   } catch (err) {
     if (token !== g_computeToken) return;
     console.error(err);
@@ -1908,6 +1972,7 @@ function trajectoryMatBlob(result) {
     dcf: { data: result.dcf, shape: [result.dcf.length, 1] },
     girf_applied: { data: Float32Array.of(result.girf_applied ? 1 : 0), shape: [1, 1] },
     girf_delay_us: { data: Float32Array.of(result.girf_delay_us), shape: [1, 1] },
+    bit_reversal: { data: Float32Array.of(result.bit_reversal ? 1 : 0), shape: [1, 1] },
     flat_dcf: { data: Float32Array.of(result.flat_dcf ? 1 : 0), shape: [1, 1] },
     dcf_nyquist_radius: { data: Float32Array.of(result.dcf_nyquist_radius), shape: [1, 1] },
   });
@@ -1922,6 +1987,7 @@ async function trajectoryNpzBlob(result) {
     dcf: { data: result.dcf, shape: [result.dcf.length] },
     girf_applied: { data: Float32Array.of(result.girf_applied ? 1 : 0), shape: [1] },
     girf_delay_us: { data: Float32Array.of(result.girf_delay_us), shape: [1] },
+    bit_reversal: { data: Float32Array.of(result.bit_reversal ? 1 : 0), shape: [1] },
     flat_dcf: { data: Float32Array.of(result.flat_dcf ? 1 : 0), shape: [1] },
     dcf_nyquist_radius: { data: Float32Array.of(result.dcf_nyquist_radius), shape: [1] },
   });
@@ -1942,13 +2008,19 @@ async function downloadSelectedTrajectory(format) {
   setStatus(`Computing ${mode} trajectory for .${format} download…`);
 
   try {
-    const result = await computeTrajectoryChunked(
-      g_params,
-      nSpokes,
-      useGirf ? g_girf : null,
-      fraction => { if (prog) prog.value = fraction; },
-      flatDcf,
-    );
+    const result = g_result &&
+      g_result.n_spokes === nSpokes &&
+      g_result.girf_applied === !!useGirf &&
+      g_result.flat_dcf === flatDcf
+      ? g_result
+      : await computeTrajectoryChunked(
+          g_params,
+          nSpokes,
+          useGirf ? g_girf : null,
+          fraction => { if (prog) prog.value = fraction; },
+          flatDcf,
+        );
+    setStatus(`Packaging ${mode} trajectory as .${format}…`);
     const blob = format === "mat" ? trajectoryMatBlob(result) : await trajectoryNpzBlob(result);
     triggerDownload(blob, `koreo_trajectory_${suffix}.${format}`);
     setStatus(`${mode} trajectory downloaded as .${format}.`, "ok");
@@ -1981,6 +2053,7 @@ function showTrajStats(result) {
       <tr><td>Fourier OS</td><td>${result.grid.fourier_os.toFixed(3)}</td></tr>
       <tr><td>k-space range (should be ≤ 0.5)</td><td>${absMax.toFixed(4)}</td></tr>
       <tr><td>GIRF applied</td><td>${result.girf_applied ? "yes" : "no"}</td></tr>
+      <tr><td>Bit reversal</td><td>${result.bit_reversal ? "yes" : "no"}</td></tr>
       <tr><td>GIRF delay</td><td>${result.girf_delay_us.toFixed(2)} µs</td></tr>
       <tr><td>DCF</td><td>${result.flat_dcf ? `flat after Nyquist radius ${result.dcf_nyquist_radius.toFixed(2)}` : "radial (uncut)"}</td></tr>
     </table>`;
@@ -2432,8 +2505,10 @@ function wireUp() {
   loadPersistedGirfLibrary();
 }
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", wireUp);
-} else {
-  wireUp();
+if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", wireUp);
+  } else {
+    wireUp();
+  }
 }
