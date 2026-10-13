@@ -299,6 +299,7 @@ function findLastBytes(hay, needle) {
  * MeasMiner: prefer Phoenix/XProtocol, then fall back to ASCCONV.
  */
 export async function extractScannerProtocol(file, measurement) {
+  if (measurement.container === "DICOM") return measurement.protocol;
   const want = Math.min(measurement.length || TEXT_SCAN_BYTES, TEXT_SCAN_BYTES);
   const end = Math.min(file.size, measurement.offset + want);
   const bytes = new Uint8Array(await file.slice(measurement.offset, end).arrayBuffer());
@@ -319,6 +320,85 @@ export async function extractScannerProtocol(file, measurement) {
     return { bytes: bytes.slice(start, blockEnd), format: format.name };
   }
   return null;
+}
+
+export async function readDicomMeasurement(file) {
+  const bytes = new Uint8Array(await file.slice(0, TEXT_SCAN_BYTES).arrayBuffer());
+  const decoder = new TextDecoder("latin1");
+  if (bytes.length < 132 || decoder.decode(bytes.subarray(128, 132)) !== "DICM") return null;
+  const view = new DataView(bytes.buffer);
+  const longVR = new Set(["OB", "OD", "OF", "OL", "OV", "OW", "SQ", "UC", "UN", "UR", "UT"]);
+  let syntax = "1.2.840.10008.1.2.1";
+  let manufacturer = "";
+  const candidates = [];
+  function header(at, explicit, little) {
+    if (at + 8 > bytes.length) throw new Error("DICOM metadata is truncated or exceeds the header read limit.");
+    const group = view.getUint16(at, little);
+    const element = view.getUint16(at + 2, little);
+    const vr = explicit && group !== 0xfffe ? decoder.decode(bytes.subarray(at + 4, at + 6)) : "";
+    const wide = longVR.has(vr);
+    const start = at + (wide ? 12 : 8);
+    if (start > bytes.length) throw new Error("Truncated DICOM element header.");
+    const length = vr ? (wide ? view.getUint32(at + 8, little) : view.getUint16(at + 6, little)) : view.getUint32(at + 4, little);
+    return { group, element, start, length, vr };
+  }
+  function walk(offset, limit, creators, depth = 0) {
+    if (depth > 32) throw new Error("DICOM sequence nesting is too deep.");
+    while (offset + 8 <= limit) {
+    const meta = depth === 0 && view.getUint16(offset, true) === 2;
+    const little = meta || syntax !== "1.2.840.10008.1.2.2";
+    const explicit = meta || syntax !== "1.2.840.10008.1.2";
+    const item = header(offset, explicit, little);
+    if (item.group === 0xfffe && (item.element === 0xe00d || item.element === 0xe0dd)) return item.start;
+    if (item.group === 0x7fe0) return limit;
+    const end = item.start + item.length;
+    const sequence = item.vr === "SQ" || item.length === 0xffffffff ||
+      (item.length >= 8 && item.start + 8 <= bytes.length && view.getUint16(item.start, little) === 0xfffe);
+    if (sequence || (item.group === 0xfffe && item.element === 0xe000)) {
+      if (item.length !== 0xffffffff && end > limit) {
+        if (candidates.length) return limit;
+        throw new Error("DICOM metadata is truncated or exceeds the header read limit.");
+      }
+      const next = walk(item.start, item.length === 0xffffffff ? limit : end, new Map(creators), depth + 1);
+      offset = item.length === 0xffffffff ? next : end;
+      continue;
+    }
+    if (end > limit) {
+      if (candidates.length) return limit;
+      throw new Error("DICOM metadata is truncated or exceeds the header read limit.");
+    }
+    const value = bytes.subarray(item.start, end);
+    if (meta && item.element === 0x0010) {
+      syntax = decoder.decode(value).replace(/[\0 ]+$/g, "");
+      if (syntax === "1.2.840.10008.1.2.1.99") throw new Error("Deflated DICOM metadata is not supported.");
+    }
+    if (item.group === 8 && item.element === 0x0070) manufacturer = decoder.decode(value).trim();
+    if (item.group % 2 === 1 && item.element >= 0x10 && item.element <= 0xff)
+      creators.set(`${item.group}:${item.element}`, decoder.decode(value).trim());
+    if (item.group % 2 === 1 && item.element >= 0x1000 &&
+        /SIEMENS/i.test(creators.get(`${item.group}:${item.element >> 8}`) || "")) {
+      const text = decoder.decode(value);
+      const start = text.indexOf("<XProtocol>");
+      const ascStart = text.indexOf("### ASCCONV BEGIN");
+      const ascEnd = text.indexOf("### ASCCONV END ###", ascStart);
+      if (start >= 0 && ascStart >= start && ascEnd > ascStart && /\}\s*[\0 ]*$/.test(text)) {
+        const protocol = { bytes: value.slice(start, text.replace(/[\0 ]+$/g, "").length), format: "XProtocol" };
+        candidates.unshift(protocol);
+      } else if (ascStart >= 0 && ascEnd > ascStart) {
+        candidates.push({ bytes: value.slice(ascStart, ascEnd + "### ASCCONV END ###".length), format: "ASCCONV" });
+      }
+    }
+    offset = end;
+    }
+    if (limit === bytes.length || offset === limit) return limit;
+    throw new Error("DICOM metadata is truncated.");
+  }
+  walk(132, bytes.length, new Map());
+  if (!/SIEMENS/i.test(manufacturer)) throw new Error("Only Siemens DICOM files are supported.");
+  const protocol = candidates[0];
+  if (!protocol) throw new Error("No embedded Siemens scanner protocol was found.");
+  const text = decoder.decode(protocol.bytes).replace(/""/g, '"');
+  return { index: 0, offset: 0, length: file.size, patName: "", protName: matchString(text, "tProtocolName") || "", container: "DICOM", protocol, text };
 }
 
 function safeDownloadStem(value, fallback = "koreo_protocol") {
@@ -490,6 +570,7 @@ function inferScannerTypeFromMetadata(p) {
  * Field indices mirror WIPdefines_ute.h conventions (see the plan).
  */
 export function parseParamsFromProtocol(text) {
+  text = text.replace(/sWipMemBlock/g, "sWiPMemBlock");
   const firstDef = (...vs) => vs.find(v => v !== undefined && !Number.isNaN(v));
   const firstPositive = (...vs) => vs.find(v => Number.isFinite(v) && v > 0);
   const p = {};
@@ -1918,6 +1999,8 @@ let g_computeToken = 0;
 // (typing in a param field) collapse into a single run.
 function scheduleCompute(delay = 450) {
   if (!g_params) return;
+  if (g_params._measurement?.container === "DICOM" &&
+      ![SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794, SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE].includes(g_params._seq_flavor)) return;
   clearTimeout(g_computeTimer);
   g_result = null;
   $("#download-mat").disabled = true;
@@ -2084,26 +2167,40 @@ function handleDragLeave() { $("#drop").classList.remove("dragover"); }
 async function loadMeasurement(measurement) {
   $("#download-pro").disabled = true;
   setStatus(`Reading measurement #${measurement.index} (${measurement.protName || "unnamed"})…`);
-  const text = await readMeasurementText(g_file, measurement);
-  if (!/sKSpace|sWiPMemBlock|sRXSPEC/.test(text))
+  const isDicom = measurement.container === "DICOM";
+  const text = isDicom ? measurement.text : await readMeasurementText(g_file, measurement);
+  if (!isDicom && !/sKSpace|sWiPMemBlock|sRXSPEC/.test(text))
     throw new Error(`Measurement #${measurement.index} has no Siemens MrProtocol text.`);
   g_params = parseParamsFromProtocol(text);
   g_girf = null;
   updateTrajectoryMode(false);
+  g_params._measurement = {
+    index: measurement.index, count: g_measurements.length,
+    protName: measurement.protName, container: measurement.container,
+  };
   g_params._seq_flavor = detectSequenceFlavor(g_params._seq_name, measurement.protName);
+  if (isDicom) {
+    $("#params-panel")?.classList.remove("hidden");
+    $("#traj-panel")?.classList.remove("hidden");
+    $("#traj-stats").replaceChildren();
+    renderParams(g_params);
+    $("#download-pro").disabled = false;
+    $("#download-json").disabled = false;
+    g_params._trajectory_estimated = true;
+  }
 
   // Only real UTE sequences are supported. Reject anything else so we never
   // present a bogus trajectory for an unrelated sequence.
   if (g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.OTHER) {
-    $("#params-panel")?.classList.add("hidden");
-    $("#traj-panel")?.classList.add("hidden");
+    if (!isDicom) $("#params-panel")?.classList.add("hidden");
+    if (!isDicom) $("#traj-panel")?.classList.add("hidden");
     throw new Error(
       `Unsupported sequence "${g_params._seq_name || measurement.protName || "unknown"}". ` +
       `Only wip_794_ute and the product UTE sequence are supported.`);
   }
   if (g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.DUDE) {
-    $("#params-panel")?.classList.add("hidden");
-    $("#traj-panel")?.classList.add("hidden");
+    if (!isDicom) $("#params-panel")?.classList.add("hidden");
+    if (!isDicom) $("#traj-panel")?.classList.add("hidden");
     throw new Error("wip_DUDE detected — support is planned but not yet available.");
   }
 
@@ -2111,7 +2208,7 @@ async function loadMeasurement(measurement) {
   const shouldTrySeqData =
     g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794 ||
     g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE;
-  const seqData = shouldTrySeqData ? await extractUteSeqData(g_file, measurement) : null;
+  const seqData = shouldTrySeqData && !isDicom ? await extractUteSeqData(g_file, measurement) : null;
   if (seqData) {
     g_params.gd_iso                 = seqData.fGradientDelayIso;
     g_params.gd_x                   = seqData.fGradientDelayX;
@@ -2136,12 +2233,17 @@ async function loadMeasurement(measurement) {
   } else {
     g_params._seq_data_source       = "ASCII MrProtocol only";
   }
+  if (isDicom) g_params._seq_data_source = "ASCII MrProtocol only";
+  if (g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE) {
+    g_params.off_center_oversampling = 200;
+    g_params.n_col_meas_raw = Math.round(g_params.n_base_resolution * 2);
+  }
 
   // Oreo derives arbitrary orientation from mean(image.slicePos), whose final
   // four values are the binary MDH quaternion. Prefer that exact matrix over
   // the protocol-normal fallback used for strict orthogonal scans.
   try {
-    const quaternion = await extractMdhSliceQuaternion(g_file, measurement);
+    const quaternion = isDicom ? null : await extractMdhSliceQuaternion(g_file, measurement);
     const matrix = quaternionToMatrix(quaternion);
     if (quaternion && matrix) {
       g_params.slice_quaternion = quaternion;
@@ -2211,10 +2313,20 @@ async function handleFile(file) {
   if (!file) return;
   $("#download-pro").disabled = true;
   $("#girf-panel")?.classList.add("hidden");
+  ++g_computeToken;
+  clearTimeout(g_computeTimer);
+  g_result = null;
+  g_params = null;
+  $("#download-mat").disabled = true;
+  $("#download-npz").disabled = true;
+  $("#download-json").disabled = true;
+  $("#params-panel")?.classList.add("hidden");
+  $("#traj-panel")?.classList.add("hidden");
   g_file = file;
   setStatus(`Inspecting ${file.name} (${(file.size/1e6).toFixed(1)} MB)…`);
   try {
-    g_measurements = await listTwixMeasurements(file);
+    const dicom = await readDicomMeasurement(file);
+    g_measurements = dicom ? [dicom] : await listTwixMeasurements(file);
     const chosen = pickUteMeasurement(g_measurements);
     await loadMeasurement(chosen);
   } catch (err) {
@@ -2481,7 +2593,7 @@ function wireUp() {
     try {
       const protocol = await extractScannerProtocol(g_file, measurement);
       if (!protocol) throw new Error("No Phoenix/XProtocol or ASCCONV block was found");
-      const sourceStem = g_file.name.replace(/\.dat$/i, "");
+      const sourceStem = g_file.name.replace(/\.(?:dat|dcm|ima)$/i, "");
       const filename = `${safeDownloadStem(sourceStem)}.pro`;
       triggerDownload(new Blob([protocol.bytes], { type: "application/octet-stream" }), filename);
       setStatus(`${protocol.format} scanner protocol downloaded as ${filename}.`, "ok");
