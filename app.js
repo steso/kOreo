@@ -299,7 +299,25 @@ function findLastBytes(hay, needle) {
  * MeasMiner: prefer Phoenix/XProtocol, then fall back to ASCCONV.
  */
 export async function extractScannerProtocol(file, measurement) {
-  if (measurement.container === "DICOM") return measurement.protocol;
+  if (measurement.container === "DICOM") {
+    const original = measurement.protocol.bytes;
+    const text = new TextDecoder("latin1").decode(original);
+    const start = text.indexOf("### ASCCONV BEGIN");
+    const marker = "### ASCCONV END ###";
+    const end = text.indexOf(marker, start);
+    if (start < 0 || end < start) throw new Error("No complete ASCCONV block was found in the embedded protocol.");
+    const quoted = measurement.protocol.format === "XProtocol";
+    const output = [];
+    for (let offset = start; offset < end + marker.length; ++offset) {
+      const value = original[offset];
+      if (quoted && value === 34 && original[offset + 1] === 34) ++offset;
+      if (value === 13) continue;
+      if (value === 10) output.push(13);
+      output.push(value);
+    }
+    output.push(13, 10);
+    return { bytes: new Uint8Array(output), format: "ASCCONV" };
+  }
   const want = Math.min(measurement.length || TEXT_SCAN_BYTES, TEXT_SCAN_BYTES);
   const end = Math.min(file.size, measurement.offset + want);
   const bytes = new Uint8Array(await file.slice(measurement.offset, end).arrayBuffer());
@@ -1981,7 +1999,7 @@ function drawLineChart(ctx, x0, y0, w, h, title, xLabel, series, opts = {}) {
 // Recompute + redraw the 1-D diagnostic profiles from the current params and
 // GIRF selection. Cheap (single readout), so it can run on every edit.
 function refreshProfiles() {
-  if (!g_params) return;
+  if (!g_params || ![SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794, SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE].includes(g_params._seq_flavor)) return;
   const useGirf = selectedGirf();
   try {
     const profiles = computeSamplingProfiles(g_params, useGirf ? g_girf : null);
@@ -1999,8 +2017,7 @@ let g_computeToken = 0;
 // (typing in a param field) collapse into a single run.
 function scheduleCompute(delay = 450) {
   if (!g_params) return;
-  if (g_params._measurement?.container === "DICOM" &&
-      ![SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794, SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE].includes(g_params._seq_flavor)) return;
+  if (![SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794, SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE].includes(g_params._seq_flavor)) return;
   clearTimeout(g_computeTimer);
   g_result = null;
   $("#download-mat").disabled = true;
@@ -2009,7 +2026,7 @@ function scheduleCompute(delay = 450) {
 }
 
 async function runCompute() {
-  if (!g_params) return;
+  if (!g_params || ![SUPPORTED_SEQ_FLAVORS.CUSTOMER_UTE_794, SUPPORTED_SEQ_FLAVORS.SIEMENS_UTE].includes(g_params._seq_flavor)) return;
   const nSpokes = parseInt($("#n-spokes").value, 10) || 1000;
   const useGirf = selectedGirf();
   const flatDcf = $("#flat-dcf")?.checked ?? true;
@@ -2165,11 +2182,23 @@ function handleDragOver(ev) { ev.preventDefault(); $("#drop").classList.add("dra
 function handleDragLeave() { $("#drop").classList.remove("dragover"); }
 
 async function loadMeasurement(measurement) {
+  ++g_computeToken;
+  clearTimeout(g_computeTimer);
+  g_result = null;
+  $("#download-mat").disabled = true;
+  $("#download-npz").disabled = true;
+  $("#download-json").disabled = true;
   $("#download-pro").disabled = true;
+  $("#girf-panel")?.classList.add("hidden");
+  $("#compute-progress")?.classList.add("hidden");
+  $("#traj-stats").replaceChildren();
+  const preview = $("#preview");
+  preview?.getContext("2d")?.clearRect(0, 0, preview.width, preview.height);
   setStatus(`Reading measurement #${measurement.index} (${measurement.protName || "unnamed"})…`);
   const isDicom = measurement.container === "DICOM";
   const text = isDicom ? measurement.text : await readMeasurementText(g_file, measurement);
-  if (!isDicom && !/sKSpace|sWiPMemBlock|sRXSPEC/.test(text))
+  const protocol = await extractScannerProtocol(g_file, measurement);
+  if (!protocol && !/sKSpace|sWiPMemBlock|sRXSPEC/.test(text))
     throw new Error(`Measurement #${measurement.index} has no Siemens MrProtocol text.`);
   g_params = parseParamsFromProtocol(text);
   g_girf = null;
@@ -2179,29 +2208,26 @@ async function loadMeasurement(measurement) {
     protName: measurement.protName, container: measurement.container,
   };
   g_params._seq_flavor = detectSequenceFlavor(g_params._seq_name, measurement.protName);
-  if (isDicom) {
-    $("#params-panel")?.classList.remove("hidden");
-    $("#traj-panel")?.classList.remove("hidden");
-    $("#traj-stats").replaceChildren();
-    renderParams(g_params);
-    $("#download-pro").disabled = false;
-    $("#download-json").disabled = false;
-    g_params._trajectory_estimated = true;
-  }
+  $("#params-panel")?.classList.remove("hidden");
+  $("#traj-panel")?.classList.remove("hidden");
+  renderParams(g_params);
+  renderMeasurementPicker();
+  $("#download-pro").disabled = !protocol;
+  $("#download-json").disabled = false;
+  if (isDicom) g_params._trajectory_estimated = true;
 
   // Only real UTE sequences are supported. Reject anything else so we never
   // present a bogus trajectory for an unrelated sequence.
   if (g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.OTHER) {
-    if (!isDicom) $("#params-panel")?.classList.add("hidden");
-    if (!isDicom) $("#traj-panel")?.classList.add("hidden");
-    throw new Error(
-      `Unsupported sequence "${g_params._seq_name || measurement.protName || "unknown"}". ` +
-      `Only wip_794_ute and the product UTE sequence are supported.`);
+    setStatus(
+      `Trajectory unavailable for sequence "${g_params._seq_name || measurement.protName || "unknown"}". ` +
+      (protocol ? "Scanner protocol export is available." : "No exportable scanner protocol was found."), "warn");
+    return;
   }
   if (g_params._seq_flavor === SUPPORTED_SEQ_FLAVORS.DUDE) {
-    if (!isDicom) $("#params-panel")?.classList.add("hidden");
-    if (!isDicom) $("#traj-panel")?.classList.add("hidden");
-    throw new Error("wip_DUDE detected — support is planned but not yet available.");
+    setStatus("wip_DUDE trajectory support is not yet available. " +
+      (protocol ? "Scanner protocol export is available." : "No exportable scanner protocol was found."), "warn");
+    return;
   }
 
   // Binary UteSeqData packet — authoritative for scanner type + per-axis delays.
@@ -2289,7 +2315,7 @@ async function loadMeasurement(measurement) {
   $("#girf-panel")?.classList.remove("hidden");
   renderParams(g_params);
   renderMeasurementPicker();
-  $("#download-pro").disabled = false;
+  $("#download-pro").disabled = !protocol;
   autoLoadGirf();
   // Default spoke count to the scan's own projection count
   const nSpokesInput = $("#n-spokes");
